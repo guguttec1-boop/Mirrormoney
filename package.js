@@ -1,0 +1,14 @@
+{
+  "name": "telegram-api",
+  "version": "1.0.0",
+  "description": "Backend for posting images to Telegram",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "multer": "^1.4.5-lts.1"
+  }
+}
