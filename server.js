@@ -4,36 +4,45 @@ const multer = require("multer");
 const admin = require("firebase-admin");
 
 const app = express();
-app.use(cors());
 
-/* ---------- Firebase (from separate env vars) ---------- */
+/* ---------- CORS (explicit) ---------- */
+app.use(cors({
+  origin: "*",
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type"]
+}));
+app.options("*", cors());            // <-- handles any stray preflight
+
+/* ---------- Request logger (fires FIRST, before anything else) ---------- */
+app.use((req, res, next) => {
+  console.log(`📡 ${new Date().toISOString()} ${req.method} ${req.originalUrl} | ct=${req.headers["content-type"] || "-"} | origin=${req.headers.origin || "-"}`);
+  next();
+});
+
+/* ---------- Firebase ---------- */
 if (!admin.apps.length) {
   const privateKey = (process.env.FIREBASE_PRIVATE_KEY || "")
-    // Render stores "\n" as literal backslash-n; turn them into real newlines
-    .replace(/\\n/g, "\n")
-    .trim();
+    .replace(/\\n/g, "\n").trim();
 
-  if (
-    !process.env.FIREBASE_PROJECT_ID ||
-    !process.env.FIREBASE_CLIENT_EMAIL ||
-    !privateKey ||
-    !process.env.FIREBASE_DATABASE_URL
-  ) {
+  if (!process.env.FIREBASE_PROJECT_ID ||
+      !process.env.FIREBASE_CLIENT_EMAIL ||
+      !privateKey ||
+      !process.env.FIREBASE_DATABASE_URL) {
     console.error("❌ Missing Firebase env vars. Check Render settings.");
   }
 
   admin.initializeApp({
     credential: admin.credential.cert({
-      projectId: process.env.FIREBASE_PROJECT_ID,
+      projectId:   process.env.FIREBASE_PROJECT_ID,
       clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-      privateKey: privateKey,
+      privateKey:  privateKey,
     }),
     databaseURL: process.env.FIREBASE_DATABASE_URL,
   });
 }
 const db = admin.database();
 
-/* ---------- Multer ---------- */
+/* ---------- Multer (only ONE field allowed: "image") ---------- */
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 },
@@ -44,28 +53,32 @@ app.get("/", (req, res) => {
   res.json({ status: "online", message: "Telegram API is running" });
 });
 
-/* ---------- Post route ---------- */
-app.post("/post-to-telegram", upload.single("image"), async (req, res) => {
+/* ---------- POST /post-to-telegram ---------- */
+app.post("/post-to-telegram", (req, res, next) => {
+  console.log("➡️  Reached /post-to-telegram, about to run multer");
+  next();
+}, upload.single("image"), async (req, res) => {
+  console.log("✅ Multer done. File present:", !!req.file,
+              "| size:", req.file?.size,
+              "| fieldname:", req.file?.fieldname,
+              "| mimetype:", req.file?.mimetype);
+
   try {
     if (!req.file) {
-      return res
-        .status(400)
-        .json({ success: false, error: "No image received" });
+      console.warn("❌ No file received");
+      return res.status(400).json({ success: false, error: "No image received" });
     }
 
     const caption = (req.body.caption || "").trim();
-
-    const botToken = process.env.TELEGRAM_BOT_TOKEN;
+    const botToken  = process.env.TELEGRAM_BOT_TOKEN;
     const channelId = process.env.TELEGRAM_CHANNEL_ID;
 
     if (!botToken || !channelId) {
-      return res.status(500).json({
-        success: false,
-        error: "Telegram configuration is missing",
-      });
+      console.error("❌ Missing Telegram env vars");
+      return res.status(500).json({ success: false, error: "Telegram configuration missing" });
     }
 
-    /* --- 1. Send to Telegram --- */
+    /* --- Send to Telegram --- */
     const telegramUrl = `https://api.telegram.org/bot${botToken}/sendPhoto`;
 
     const formData = new FormData();
@@ -77,59 +90,69 @@ app.post("/post-to-telegram", upload.single("image"), async (req, res) => {
       req.file.originalname || "image.jpg"
     );
 
-    const telegramResponse = await fetch(telegramUrl, {
-      method: "POST",
-      body: formData,
-    });
-    const telegramResult = await telegramResponse.json();
+    console.log("📤 Sending to Telegram...");
+    const telegramResponse = await fetch(telegramUrl, { method: "POST", body: formData });
+    const telegramResult   = await telegramResponse.json();
 
     if (!telegramResult.ok) {
-      console.error("Telegram error:", telegramResult);
+      console.error("❌ Telegram API error:", telegramResult);
       return res.status(500).json({
         success: false,
-        error: telegramResult.description || "Telegram send failed",
+        error: telegramResult.description || "Telegram send failed"
       });
     }
 
-    const message = telegramResult.result;
-    const fileId = message.photo
+    const message  = telegramResult.result;
+    const fileId   = message.photo
       ? message.photo[message.photo.length - 1].file_id
       : null;
 
-    /* --- 2. Save to Realtime DB --- */
+    /* --- Build a Telegram deep-link for the post --- */
+    // channelId looks like "-1004394988713"
+    const numericChannel = String(channelId).replace(/^-100/, "");
+    const postLink = `https://t.me/c/${numericChannel}/${message.message_id}`;
+
+    /* --- Save to Realtime DB --- */
     const postRef = db.ref("posts").push();
     const postData = {
       caption,
       messageId: message.message_id,
       fileId,
       channelId,
+      postLink,
       telegramDate: message.date || null,
       createdAt: admin.database.ServerValue.TIMESTAMP,
     };
-
     await postRef.set(postData);
 
-    /* --- 3. Respond --- */
+    console.log("💾 Saved to Firebase:", postRef.key, "| link:", postLink);
+
+    /* --- Respond with EVERYTHING the client needs --- */
     res.json({
       success: true,
-      key: postRef.key,
+      post_id:   postRef.key,
+      postId:    postRef.key,
+      key:       postRef.key,
       messageId: message.message_id,
-      fileId,
+      fileId:    fileId,
+      postLink:  postLink,
+      postText:  caption,
+      channelId: channelId
     });
   } catch (error) {
-    console.error("Server error:", error);
-    res.status(500).json({ success: false, error: "Server error" });
+    console.error("❌ Server error in /post-to-telegram:", error);
+    res.status(500).json({ success: false, error: error.message || "Server error" });
   }
 });
 
-/* ---------- Multer / generic error handler ---------- */
+/* ---------- Multer / generic error handler (MUST log) ---------- */
 app.use((err, req, res, next) => {
+  console.error("🔥 Express error handler caught:", err.name, err.message);
   if (err instanceof multer.MulterError) {
-    return res.status(400).json({ success: false, error: err.message });
+    return res.status(400).json({ success: false, error: `Multer: ${err.code} — ${err.message}` });
   }
-  console.error(err);
   res.status(500).json({ success: false, error: "Server error" });
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
